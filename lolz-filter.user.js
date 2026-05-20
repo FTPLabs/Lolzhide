@@ -3,7 +3,9 @@
 // @namespace    https://lolz.live/
 // @version      12.0
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
-// @author       you
+// @author       FTPDev (lolz.live/ftpdev)
+// @homepageURL  https://github.com/FTPLabs/Lolzhide
+// @supportURL   https://lolz.live/ftpdev
 // @match        https://lolz.live/forums/*
 // @match        https://lolz.guru/forums/*
 // @match        https://zelenka.guru/forums/*
