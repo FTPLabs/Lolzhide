@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      13.0
+// @version      13.1
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -14,6 +14,9 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @connect      prod-api.lolz.live
+// @connect      lolz.live
+// @connect      lolz.guru
+// @connect      zelenka.guru
 // @run-at       document-end
 // ==/UserScript==
 
@@ -29,7 +32,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '13.0';
+    const VERSION       = '13.1';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -412,6 +415,144 @@
     }
 
     // ═══════════════════════════════════════════════════════════════
+    //  ПРОВЕРКА СТРАНИЦ ТЕМ (чтение блока «Ограничение ответов»)
+    //
+    //  API не возвращает thread_post_delay в list-эндпоинте.
+    //  Поэтому читаем HTML страницы темы и ищем текст:
+    //    "Задержка перед следующим сообщением пользователя: N часов"
+    //
+    //  Параллельность: MAX_PAGE_PARALLEL запросов одновременно (не через API-очередь).
+    //  Кэш: PAGE_CACHE_TTL мс в sessionStorage (отдельно от API-кэша).
+    // ═══════════════════════════════════════════════════════════════
+
+    const PAGE_CACHE_TTL    = 5 * 60 * 1000;   // 5 минут
+    const MAX_PAGE_PARALLEL = 5;                // параллельных запросов страниц
+    let   _pagePending      = 0;
+    const _pageQ            = [];
+
+    function _drainPageQ() {
+        while (_pagePending < MAX_PAGE_PARALLEL && _pageQ.length > 0) {
+            _pagePending++;
+            const { fn, resolve, reject } = _pageQ.shift();
+            fn().then(resolve).catch(reject).finally(() => { _pagePending--; _drainPageQ(); });
+        }
+    }
+
+    // Ставит HTTP-запрос страницы в очередь (не через API rate-limiter)
+    function _fetchPageHtml(url) {
+        return new Promise((res, rej) => {
+            _pageQ.push({
+                fn: () => new Promise((resolve, reject) => {
+                    GM_xmlhttpRequest({
+                        method:  'GET',
+                        url,
+                        headers: { Accept: 'text/html,*/*' },
+                        timeout: 15000,
+                        onload(r)   { r.status === 200 ? resolve(r.responseText) : reject(new Error(`HTTP ${r.status}`)); },
+                        onerror()   { reject(new Error('сетевая ошибка')); },
+                        ontimeout() { reject(new Error('таймаут'));         },
+                    });
+                }),
+                resolve: res,
+                reject:  rej,
+            });
+            _drainPageQ();
+        });
+    }
+
+    // Ищет задержку в HTML. Возвращает число > 0 если задержка есть, иначе 0.
+    // Паттерн: «Задержка перед следующим сообщением пользователя: 48 часов»
+    function _parsePageDelay(html) {
+        // Убираем теги, нормализуем пробелы
+        const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+        const m = text.match(/Задержка перед следующим сообщением[^:]*:\s*(\d+)/i);
+        if (m) return parseInt(m[1], 10);
+        // Запасной вариант: JSON в странице (XenForo иногда встраивает данные)
+        const jm = html.match(/"thread_post_delay"\s*:\s*(\d+)/);
+        if (jm) return parseInt(jm[1], 10);
+        return 0;
+    }
+
+    // Кэш результатов проверки страниц (отдельно от API-кэша)
+    function _getPageCache(id) {
+        try {
+            const raw = sessionStorage.getItem(`lolzfp_pc_${id}`);
+            if (!raw) return null;
+            const c = JSON.parse(raw);
+            return (Date.now() - c.ts < PAGE_CACHE_TTL) ? c : null;
+        } catch { return null; }
+    }
+    function _setPageCache(id, delay) {
+        try { sessionStorage.setItem(`lolzfp_pc_${id}`, JSON.stringify({ ts: Date.now(), delay })); }
+        catch {}
+    }
+
+    // URL темы из DOM (для GM_xmlhttpRequest нужен абсолютный URL)
+    function _getThreadUrl(threadId) {
+        const row = findRow(String(threadId));
+        if (!row) return null;
+        const a = row.querySelector(
+            'h3 a, h4 a, .title a, .discussionListItem--title a, ' +
+            '.structItem-title a, a.listBlock-topic, a[href*="threads/"]'
+        );
+        if (!a) return null;
+        try { return new URL(a.getAttribute('href') || '', location.href).href; } catch { return null; }
+    }
+
+    // Запускает фоновую проверку страниц тем на наличие КД.
+    // НЕ блокирует run() — вызывается без await.
+    // Обновляет combined и перерисовывает фильтр по мере готовности результатов.
+    function startPageChecks(domIds, combined, runId) {
+        if (!cfg.hideCantPart) return;
+
+        // 1. Мгновенно применяем кэшированные результаты
+        let cacheApplied = false;
+        for (const id of domIds) {
+            const c = _getPageCache(id);
+            if (c !== null && c.delay > 0) {
+                const t = combined.get(id);
+                if (t && !t._pageDelay) {
+                    combined.set(id, { ...t, _pageDelay: c.delay });
+                    cacheApplied = true;
+                }
+            }
+        }
+        if (cacheApplied && runId === _runId) applyFilter(combined);
+
+        // 2. Фетчим страницы у которых нет кэша
+        const toFetch = domIds.filter(id => _getPageCache(id) === null);
+        if (toFetch.length === 0) return;
+
+        log(`pageCheck: ${toFetch.length} тем без кэша, запускаем фоновую проверку…`);
+
+        const REAPPLY_EVERY = 5;    // перерисовывать каждые N результатов
+        let done = 0;
+
+        for (const id of toFetch) {
+            const url = _getThreadUrl(id);
+            if (!url) { _setPageCache(id, 0); done++; continue; }
+
+            _fetchPageHtml(url)
+                .then(html => {
+                    const delay = _parsePageDelay(html);
+                    _setPageCache(id, delay);
+                    if (delay > 0) {
+                        const t = combined.get(id);
+                        if (t) combined.set(id, { ...t, _pageDelay: delay });
+                    }
+                })
+                .catch(e => { log(`pageCheck ${id}: ${e.message}`); _setPageCache(id, 0); })
+                .finally(() => {
+                    done++;
+                    const isLast = done === toFetch.length;
+                    if ((done % REAPPLY_EVERY === 0 || isLast) && runId === _runId) {
+                        applyFilter(combined);
+                    }
+                });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     //  ЗАГРУЗКА ТРЕДОВ
     //
     //  GET /threads?forum_id=X&page=Y&limit=L&fields_include=*
@@ -474,11 +615,12 @@
         }
 
         // 2. КД / Нельзя участвовать
-        //    a) thread_post_delay > 0  — в теме есть любая задержка (даже 1 мин)
-        //    b) permissions.reply = false — сейчас нельзя ответить (активный КД, лимит и т.д.)
-        //    c) contest.permissions.can_participate = false — нельзя участвовать в раздаче
+        //    a) _pageDelay > 0 — задержка найдена на странице темы (HTML-парсинг, приоритет)
+        //    b) thread_post_delay > 0 — из API (запасной вариант)
+        //    c) permissions.reply = false — сейчас нельзя ответить
+        //    d) contest.permissions.can_participate = false — нельзя участвовать в раздаче
         if (cfg.hideCantPart) {
-            const _delay = t.thread_post_delay ?? t.thread_reply_cooldown ?? 0;
+            const _delay = t._pageDelay ?? t.thread_post_delay ?? t.thread_reply_cooldown ?? 0;
             if (_delay > 0)
                 return { hide: true, reason: 'postDelay' };
             if (t.permissions?.reply === false)
@@ -1312,9 +1454,14 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
 
             if (runId !== _runId) return;
 
-            // ── Шаг 3: применяем фильтр ──────────────────────────────────
+            // ── Шаг 3: применяем фильтр (мгновенно, на данных API) ───────
             _lastMap = combined;
             applyFilter(combined);
+
+            // ── Шаг 4: фоновая проверка страниц тем на КД ────────────────
+            // Не await — запускается параллельно, перерисовывает фильтр по мере готовности.
+            // Кэш 5 мин: повторные запуски в течение 5 мин используют кэш без HTTP-запросов.
+            startPageChecks(domIds, combined, runId);
 
         } catch (e) {
             log('run() ошибка:', e.message);
