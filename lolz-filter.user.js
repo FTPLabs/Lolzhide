@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.4
+// @version      12.5
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -29,7 +29,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.4';
+    const VERSION       = '12.5';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -330,7 +330,7 @@
     //  limit=50 — запрашиваем 50 тредов за раз (форум показывает до 50 на странице).
     // ═══════════════════════════════════════════════════════════════
 
-    const THREADS_PER_PAGE = 50;
+    const THREADS_PER_PAGE = 250;
 
     async function loadPage(fid, page) {
         const hit = getCached(fid, page);
@@ -339,7 +339,7 @@
             return hit;
         }
 
-        const qs = `?forum_id=${fid}&page=${page}&limit=${THREADS_PER_PAGE}&fields_include=*&fields_exclude=first_post,last_post`;
+        const qs = `?forum_id=${fid}&page=${page}&limit=${THREADS_PER_PAGE}&fields_include=*`;
         log(`API запрос: /threads${qs}`);
 
         const data = await apiGet('/threads' + qs);
@@ -383,7 +383,8 @@
         //    b) permissions.reply = false — сейчас нельзя ответить (активный КД, лимит и т.д.)
         //    c) contest.permissions.can_participate = false — нельзя участвовать в раздаче
         if (cfg.hideCantPart) {
-            if ((t.thread_post_delay ?? 0) > 0)
+            const _delay = t.thread_post_delay ?? t.thread_reply_cooldown ?? 0;
+            if (_delay > 0)
                 return { hide: true, reason: 'postDelay' };
             if (t.permissions?.reply === false)
                 return { hide: true, reason: 'noReply' };
@@ -392,11 +393,11 @@
         }
 
         // 3. Ключевые слова в названии
-        if (cfg.hideKw) {
+        if (cfg.hideKw && cfg.hideKw.trim()) {
             const title = (t.thread_title ?? '').toLowerCase();
-            const kws = cfg.hideKw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+            const kws = cfg.hideKw.split(/[,;]/).map(s => s.trim().toLowerCase()).filter(s => s.length > 0);
             for (const kw of kws) {
-                if (kw && title.includes(kw))
+                if (title.includes(kw))
                     return { hide: true, reason: 'keyword' };
             }
         }
@@ -552,8 +553,10 @@
         #lolzfp-badge {
             padding: 2px 10px; border-radius: 4px;
             background: rgba(255,255,255,.05); font-size: 11px; color: #aaa;
-            max-width: 600px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: default;
         }
+        .lolzfp-count { font-size: 14px; font-weight: bold; color: #f0a84b; }
+        .lolzfp-ok { font-size: 13px; font-weight: bold; color: #8bc34a; }
         #lolz-modal {
             position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
             z-index: 999999; background: #1e1e1e; border: 1px solid #444;
@@ -667,29 +670,30 @@
             return;
         }
 
-        const diag = `API:${stats.apiTotal} DOM:${stats.matched}`;
-
         if (stats.hidden === 0) {
-            el.textContent = `✓ всё видно  (${diag})`;
-            el.style.color = stats.matched > 0 ? '#8bc34a' : '#f0a84b';
+            el.innerHTML = `<span class="lolzfp-ok">✓ ${stats.matched > 0 ? 'всё видно' : '…'}</span>`;
+            el.title = `API: ${stats.apiTotal}  DOM: ${stats.matched}`;
+            el.style.color = '';
             return;
         }
 
         const parts = [];
-        if (stats.byReason.group)           parts.push(`группа:${stats.byReason.group}`);
-        if (stats.byReason.postDelay)       parts.push(`кд:${stats.byReason.postDelay}`);
-        if (stats.byReason.noReply)         parts.push(`нет отв:${stats.byReason.noReply}`);
-        if (stats.byReason.cantParticipate) parts.push(`нельзя:${stats.byReason.cantParticipate}`);
-        if (stats.byReason.keyword)         parts.push(`слово:${stats.byReason.keyword}`);
+        if (stats.byReason.group)           parts.push(`группа: ${stats.byReason.group}`);
+        if (stats.byReason.postDelay)       parts.push(`кд: ${stats.byReason.postDelay}`);
+        if (stats.byReason.noReply)         parts.push(`нет отв: ${stats.byReason.noReply}`);
+        if (stats.byReason.cantParticipate) parts.push(`нельзя: ${stats.byReason.cantParticipate}`);
+        if (stats.byReason.keyword)         parts.push(`слово: ${stats.byReason.keyword}`);
 
-        el.textContent = `скрыто ${stats.hidden}  (${parts.join(' · ')})  [${diag}]`;
-        el.style.color = '#f0a84b';
+        el.innerHTML = `скрыто <span class="lolzfp-count">${stats.hidden}</span>`;
+        el.title = parts.join(' · ') + `  |  API: ${stats.apiTotal}  DOM: ${stats.matched}`;
+        el.style.color = '';
     }
 
     function setBadgeLoading() {
         const el = document.getElementById('lolzfp-badge');
         if (!el) return;
-        el.textContent = '⏳ загрузка…';
+        el.innerHTML = '⏳';
+        el.title = 'загрузка…';
         el.style.color = '#888';
         el.classList.add('lolzfp-loading');
     }
@@ -836,7 +840,7 @@
         modal.id = 'lolz-modal';
         modal.innerHTML = `
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-  <b style="font-size:15px;">⚙ Настройки v${esc(VERSION)}</b>
+  <b style="font-size:13px;color:#aaa;">⚙ v${esc(VERSION)}</b>
   <button type="button" id="lolz-x" style="background:none;border:none;color:#888;font-size:18px;cursor:pointer;">✕</button>
 </div>
 
@@ -865,24 +869,16 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
     : already ? `<span style="color:#2a5;">✓ в списке</span>` : ''}
 </div>
 
-<div class="lm-info">
-  <b style="color:#bbb;">Что скрывает каждый фильтр:</b><br>
-  👥 <b>Группа</b> — <code>thread_reply_group_id &gt; 0</code> и твоя группа ниже требуемой<br>
-  &nbsp;&nbsp;&nbsp;&nbsp;21=Local · 22=Resident · 23=Expert · 60=Guru · 351=AI<br>
-  ⛔ <b>КД/Нельзя участв.</b> — скрывает если в теме есть <b>любая задержка</b> (<code>thread_post_delay &gt; 0</code>), нет права ответить, или <code>contest.can_participate = false</code><br>
-  🔤 <b>Ключевые слова</b> — название содержит одно из слов (регистр игнорируется)
-</div>
-
 <label style="display:block;font-size:11px;color:#888;margin-bottom:3px;">🔤 Скрывать по словам в названии (через запятую, напр.: <code>кд, кулдаун, cd,</code>):</label>
 <input type="text" id="lolz-kw" class="lm-inp" placeholder="кд, кулдаун, cd, cooldown …" value="${esc(cfg.hideKw)}" />
 
 <div class="lm-row">
   <button type="button" id="lolz-save"   class="lm-btn" style="background:#2a5;">💾 Сохранить</button>
   <button type="button" id="lolz-check"  class="lm-btn" style="background:#334;">📡 Проверить токен</button>
-  <button type="button" id="lolz-cache"  class="lm-btn" style="background:#433;">🗑 Очистить кэш</button>
-  <button type="button" id="lolz-diag"   class="lm-btn" style="background:#252540;">🔍 Диагностика</button>
-  <button type="button" id="lolz-export" class="lm-btn" style="background:#2a3a4a;">📤 Экспорт</button>
-  <button type="button" id="lolz-import" class="lm-btn" style="background:#2a3a4a;">📥 Импорт</button>
+  <button type="button" id="lolz-cache"  class="lm-btn" style="background:#433;">🗑 Кэш</button>
+  <button type="button" id="lolz-diag"   class="lm-btn" style="background:#252540;opacity:.8;">🔍</button>
+  <button type="button" id="lolz-export" class="lm-btn" style="background:#2a3a4a;opacity:.8;">📤</button>
+  <button type="button" id="lolz-import" class="lm-btn" style="background:#2a3a4a;opacity:.8;">📥</button>
 </div>
 <div id="lolz-st" style="margin-top:8px;font-size:12px;min-height:16px;color:#aaa;word-break:break-all;"></div>
 
