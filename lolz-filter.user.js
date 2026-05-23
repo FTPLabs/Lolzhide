@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.9
+// @version      13.0
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -29,7 +29,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.9';
+    const VERSION       = '13.0';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -389,7 +389,7 @@
         const result = new Map();
         for (let i = 0; i < ids.length; i += BATCH_SIZE) {
             const chunk = ids.slice(i, i + BATCH_SIZE);
-            const jobs  = chunk.map(id => ({ id: `t${id}`, uri: `/threads/${id}` }));
+            const jobs  = chunk.map(id => ({ id: `t${id}`, uri: `/threads/${id}?fields_include=*,thread_post_delay` }));
             try {
                 const data = await apiPost('/batch', jobs);
                 for (const id of chunk) {
@@ -431,7 +431,10 @@
             return hit;
         }
 
-        const qs = `?forum_id=${fid}&page=${page}&limit=${THREADS_PER_PAGE}&fields_include=*&fields_exclude=first_post,last_post`;
+        // fields_include=*,thread_post_delay — все поля по умолчанию + явно запрашиваем
+        // thread_post_delay (поле не задокументировано в схеме, но реально возвращается).
+        // fields_exclude УБРАН: может срезать объект permissions, что ломает фильтр КД.
+        const qs = `?forum_id=${fid}&page=${page}&limit=${THREADS_PER_PAGE}&fields_include=*,thread_post_delay`;
         log(`API запрос: /threads${qs}`);
 
         const data = await apiGet('/threads' + qs);
@@ -722,7 +725,8 @@
         const panel = document.createElement('div');
         panel.id = 'lolzfp';
 
-        const flush = () => { clearCache(currentForumId()); run(); };
+        // force=true — отменяет текущий run() и запускает немедленно
+        const flush = () => { clearCache(currentForumId()); run(true); };
 
         panel.append(
             mkToggle('👥 Группа',         cfg.hideGrp,      v => { saveCfg('hideGrp',      v); flush(); }),
@@ -1253,11 +1257,18 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
     // Типичное кол-во тредов на странице форума lolz.live
     const FORUM_PAGE_SIZE = 50;
 
-    async function run() {
+    // force=true — отменить текущий запуск и начать новый немедленно (для кнопок)
+    async function run(force = false) {
         if (!isActiveSection()) return;
         if (!cfg.apiKey)     { updateBadge(); return; }
         if (_tokenInvalid)   { updateBadge(); return; }
-        if (_running)        return;   // уже выполняется — пропускаем
+
+        if (_running) {
+            if (!force) return;   // обычный поллинг — пропускаем
+            // force: отменяем текущий run() через _runId и ждём освобождения
+            ++_runId;
+            _running = false;
+        }
 
         _running = true;
         const runId   = ++_runId;
