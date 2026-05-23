@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.8
+// @version      12.9
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -29,7 +29,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.8';
+    const VERSION       = '12.9';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -1248,15 +1248,18 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
     //  ОСНОВНОЙ ЗАПУСК
     // ═══════════════════════════════════════════════════════════════
 
-    let _runId = 0;
+    let _runId    = 0;
+    let _running  = false;   // защита от одновременного запуска двух run()
     // Типичное кол-во тредов на странице форума lolz.live
     const FORUM_PAGE_SIZE = 50;
 
     async function run() {
         if (!isActiveSection()) return;
-        if (!cfg.apiKey) { updateBadge(); return; }
-        if (_tokenInvalid) { updateBadge(); return; }
+        if (!cfg.apiKey)     { updateBadge(); return; }
+        if (_tokenInvalid)   { updateBadge(); return; }
+        if (_running)        return;   // уже выполняется — пропускаем
 
+        _running = true;
         const runId   = ++_runId;
         const fid     = currentForumId();
         const startPg = currentPage();
@@ -1268,7 +1271,7 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
 
             // ── Шаг 1: загружаем страницы API под все DOM-треды ──────────
             // Считаем сколько страниц форума загружено в DOM (infinite scroll)
-            const domIds = getAllDomThreadIds();
+            const domIds     = getAllDomThreadIds();
             const pagesInDom = Math.max(1, Math.ceil(domIds.length / FORUM_PAGE_SIZE));
 
             for (let p = startPg; p < startPg + pagesInDom; p++) {
@@ -1282,15 +1285,12 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
             // /threads/{id} возвращает ВСЕ поля (включая thread_post_delay).
             // Используем POST /batch — 10 тредов за 1 запрос вместо 10 отдельных.
             const allMissing = domIds.filter(id => !combined.has(id)).slice(0, 100);
-            const toFetch = [];
+            const toFetch    = [];
 
             for (const id of allMissing) {
                 const cached = getCached(fid, `single_${id}`);
-                if (cached && cached.has(id)) {
-                    combined.set(id, cached.get(id));
-                } else {
-                    toFetch.push(id);
-                }
+                if (cached && cached.has(id)) combined.set(id, cached.get(id));
+                else toFetch.push(id);
             }
 
             if (toFetch.length > 0) {
@@ -1306,7 +1306,6 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
             applyFilter(combined);
 
         } catch (e) {
-            if (runId !== _runId) return;
             log('run() ошибка:', e.message);
             const badge = document.getElementById('lolzfp-badge');
             if (badge) {
@@ -1314,6 +1313,9 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                 badge.textContent = '❌ ' + e.message;
                 badge.style.color = '#f55';
             }
+        } finally {
+            // Всегда сбрасываем флаг — бейдж никогда не зависнет в ⏳
+            _running = false;
         }
     }
 
