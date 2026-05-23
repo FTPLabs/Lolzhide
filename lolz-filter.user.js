@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.3.1
+// @version      12.4
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -29,7 +29,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.3.1';
+    const VERSION       = '12.4';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -379,9 +379,12 @@
         }
 
         // 2. КД / Нельзя участвовать
-        //    a) КД или нет права ответить: permissions.reply = false
-        //    b) Нельзя участвовать в contest: contest.permissions.can_participate = false
+        //    a) thread_post_delay > 0  — в теме есть любая задержка (даже 1 мин)
+        //    b) permissions.reply = false — сейчас нельзя ответить (активный КД, лимит и т.д.)
+        //    c) contest.permissions.can_participate = false — нельзя участвовать в раздаче
         if (cfg.hideCantPart) {
+            if ((t.thread_post_delay ?? 0) > 0)
+                return { hide: true, reason: 'postDelay' };
             if (t.permissions?.reply === false)
                 return { hide: true, reason: 'noReply' };
             if (t.contest?.permissions?.can_participate === false)
@@ -674,7 +677,8 @@
 
         const parts = [];
         if (stats.byReason.group)           parts.push(`группа:${stats.byReason.group}`);
-        if (stats.byReason.noReply)         parts.push(`кд:${stats.byReason.noReply}`);
+        if (stats.byReason.postDelay)       parts.push(`кд:${stats.byReason.postDelay}`);
+        if (stats.byReason.noReply)         parts.push(`нет отв:${stats.byReason.noReply}`);
         if (stats.byReason.cantParticipate) parts.push(`нельзя:${stats.byReason.cantParticipate}`);
         if (stats.byReason.keyword)         parts.push(`слово:${stats.byReason.keyword}`);
 
@@ -865,7 +869,7 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
   <b style="color:#bbb;">Что скрывает каждый фильтр:</b><br>
   👥 <b>Группа</b> — <code>thread_reply_group_id &gt; 0</code> и твоя группа ниже требуемой<br>
   &nbsp;&nbsp;&nbsp;&nbsp;21=Local · 22=Resident · 23=Expert · 60=Guru · 351=AI<br>
-  ⛔ <b>КД/Нельзя участв.</b> — <code>permissions.reply = false</code> (КД, лимит постов) или <code>contest.can_participate = false</code><br>
+  ⛔ <b>КД/Нельзя участв.</b> — скрывает если в теме есть <b>любая задержка</b> (<code>thread_post_delay &gt; 0</code>), нет права ответить, или <code>contest.can_participate = false</code><br>
   🔤 <b>Ключевые слова</b> — название содержит одно из слов (регистр игнорируется)
 </div>
 
@@ -1052,6 +1056,7 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                             `thread_reply_group_id   = ${grp}${grpName}`,
                             '',
                             `contest присутствует    = ${c !== null}`,
+                            `thread_post_delay       = ${t.thread_post_delay ?? 0}с`,
                             `permissions.reply       = ${p.reply ?? '—'}`,
                             c ? `contest.can_participate  = ${c.permissions?.can_participate}` : '',
                             '',
@@ -1060,7 +1065,11 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                                 cfg.hideGrp,
                                 grp > 0 && (myGrp > 0 && myGrp < grp),
                                 `group: req=${grp}${grpName} my=${myGrp}`),
-                            fmtVerdict('⛔ КД',
+                            fmtVerdict('⛔ КД (задержка)',
+                                cfg.hideCantPart,
+                                (t.thread_post_delay ?? 0) > 0,
+                                `postDelay=${t.thread_post_delay ?? 0}с`),
+                            fmtVerdict('⛔ КД (нет ответа)',
                                 cfg.hideCantPart,
                                 p.reply === false,
                                 `noReply [reply=${p.reply ?? '—'}]`),
@@ -1080,8 +1089,10 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                                 lines.push('  ⚠ group_id не установлен — фильтр Группа не работает (нажми ⚙ → Проверить токен)');
                             else if (grp > 0 && myGrp >= grp && cfg.hideGrp)
                                 lines.push(`  — group_id ${myGrp} >= req ${grp}: твоя группа подходит`);
+                            if ((t.thread_post_delay ?? 0) === 0 && cfg.hideCantPart)
+                                lines.push(`  — thread_post_delay=0: в теме нет задержки между постами`);
                             if (p.reply !== false && cfg.hideCantPart)
-                                lines.push(`  — permissions.reply=${p.reply ?? '—'}: нет КД`);
+                                lines.push(`  — permissions.reply=${p.reply ?? '—'}: сейчас нет активного КД`);
                             if (c === null && cfg.hideCantPart)
                                 lines.push('  — contest поля отсутствуют → НельзяУчаств. недоступно');
                             if (c && c.permissions?.can_participate !== false && cfg.hideCantPart)
