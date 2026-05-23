@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.2
+// @version      12.3
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -29,7 +29,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.2';
+    const VERSION       = '12.3';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -37,6 +37,39 @@
     const SCRIPT_INSTALL_URL = 'https://raw.githubusercontent.com/FTPLabs/Lolzhide/main/lolz-filter.user.js';
 
     let _latestVersion = null;
+
+    function autoFetchUserInfo() {
+        if (!cfg.apiKey || _tokenInvalid) return;
+        if (Number(cfg.userGrpId) > 0) return; // уже известен
+        log('group_id не установлен — запрашиваем /users/me автоматически');
+        GM_xmlhttpRequest({
+            method:  'GET',
+            url:     `${API}/users/me`,
+            headers: { 'Authorization': `Bearer ${cfg.apiKey}`, 'Accept': 'application/json' },
+            timeout: 10000,
+            onload(r) {
+                if (r.status === 401 || r.status === 403) {
+                    _tokenInvalid = true;
+                    updateBadge();
+                    return;
+                }
+                try {
+                    const d = JSON.parse(r.responseText);
+                    if (d.errors) return;
+                    const u    = d.user ?? d;
+                    const grp  = u.user_group_id ?? 0;
+                    const name = u.username ?? '';
+                    if (grp)  { cfg.userGrpId = grp;  gmSet('userGrpId', grp); }
+                    if (name) { cfg.userName  = name; gmSet('userName',  name); }
+                    log(`Авто: группа=${grp} (${GROUP_NAMES[grp] ?? '?'}), user=${name}`);
+                    // Перезапускаем фильтр с новыми данными
+                    if (cfg.hideGrp) { clearCache(currentForumId()); run(); }
+                } catch {}
+            },
+            onerror()   {},
+            ontimeout() {},
+        });
+    }
 
     function checkUpdate() {
         GM_xmlhttpRequest({
@@ -340,13 +373,20 @@
             const req = t.thread_reply_group_id ?? 0;
             if (req > 0) {
                 const my = Number(cfg.userGrpId) || 0;
-                if (my === 0 || my < req) return { hide: true, reason: 'group' };
+                // Скрываем только если group_id известен (my > 0) и ниже требуемого
+                if (my > 0 && my < req) return { hide: true, reason: 'group' };
             }
         }
 
-        // 2. Нельзя участвовать [unverified field]
-        if (cfg.hideCantPart && t.contest?.permissions?.can_participate === false)
-            return { hide: true, reason: 'cantParticipate' };
+        // 2. КД / Нельзя участвовать
+        //    a) КД или нет права ответить: permissions.reply = false
+        //    b) Нельзя участвовать в contest: contest.permissions.can_participate = false
+        if (cfg.hideCantPart) {
+            if (t.permissions?.reply === false)
+                return { hide: true, reason: 'noReply' };
+            if (t.contest?.permissions?.can_participate === false)
+                return { hide: true, reason: 'cantParticipate' };
+        }
 
         // 3. Ключевые слова в названии
         if (cfg.hideKw) {
@@ -563,7 +603,7 @@
 
         panel.append(
             mkToggle('👥 Группа',         cfg.hideGrp,      v => { saveCfg('hideGrp',      v); flush(); }),
-            mkToggle('⛔ Нельзя участв.', cfg.hideCantPart, v => { saveCfg('hideCantPart', v); flush(); }),
+            mkToggle('⛔ КД/Нельзя участв.', cfg.hideCantPart, v => { saveCfg('hideCantPart', v); flush(); }),
         );
 
         // Кнопка Peek-режима: текст синхронизирован с состоянием
@@ -618,6 +658,12 @@
             return;
         }
 
+        if (cfg.hideGrp && !(Number(cfg.userGrpId) > 0)) {
+            el.textContent = '⚠ Группа вкл., но group_id не определён — нажми ⚙ → 📡 Проверить токен';
+            el.style.color = '#f0a84b';
+            return;
+        }
+
         const diag = `API:${stats.apiTotal} DOM:${stats.matched}`;
 
         if (stats.hidden === 0) {
@@ -628,6 +674,7 @@
 
         const parts = [];
         if (stats.byReason.group)           parts.push(`группа:${stats.byReason.group}`);
+        if (stats.byReason.noReply)         parts.push(`кд:${stats.byReason.noReply}`);
         if (stats.byReason.cantParticipate) parts.push(`нельзя:${stats.byReason.cantParticipate}`);
         if (stats.byReason.keyword)         parts.push(`слово:${stats.byReason.keyword}`);
 
@@ -818,7 +865,7 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
   <b style="color:#bbb;">Что скрывает каждый фильтр:</b><br>
   👥 <b>Группа</b> — <code>thread_reply_group_id &gt; 0</code> и твоя группа ниже требуемой<br>
   &nbsp;&nbsp;&nbsp;&nbsp;21=Local · 22=Resident · 23=Expert · 60=Guru · 351=AI<br>
-  ⛔ <b>Нельзя участв.</b> — <code>contest.permissions.can_participate = false</code> <small style="color:#555;">[unverified]</small><br>
+  ⛔ <b>КД/Нельзя участв.</b> — <code>permissions.reply = false</code> (КД, лимит постов) или <code>contest.can_participate = false</code><br>
   🔤 <b>Ключевые слова</b> — название содержит одно из слов (регистр игнорируется)
 </div>
 
@@ -1005,13 +1052,19 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                             `thread_reply_group_id   = ${grp}${grpName}`,
                             '',
                             `contest присутствует    = ${c !== null}`,
-                            c ? `contest.can_participate      = ${c.permissions?.can_participate}` : '',
+                            `permissions.reply       = ${p.reply ?? '—'}`,
+                            c ? `contest.can_participate  = ${c.permissions?.can_participate}` : '',
                             '',
                             '─── Решение фильтров ───',
                             fmtVerdict('👥 Группа',
                                 cfg.hideGrp,
                                 grp > 0 && (myGrp === 0 || myGrp < grp),
                                 `group: req=${grp}${grpName} my=${myGrp}`),
+                            c
+                            fmtVerdict('⛔ КД',
+                                cfg.hideCantPart,
+                                p.reply === false,
+                                `noReply [reply=${p.reply ?? '—'}]`),
                             c
                                 ? fmtVerdict('⛔ Нельзя участв.', cfg.hideCantPart, c.permissions?.can_participate === false, 'cantParticipate')
                                 : '  ⚪ Нельзя участв.: contest нет в треде',
@@ -1024,8 +1077,12 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                         if (!hide) {
                             lines.push('');
                             lines.push('💡 Почему видим:');
-                            if (grp > 0 && myGrp >= grp && cfg.hideGrp)
+                            if (cfg.hideGrp && !(myGrp > 0))
+                                lines.push('  ⚠ group_id не установлен — фильтр Группа не работает (нажми ⚙ → Проверить токен)');
+                            else if (grp > 0 && myGrp >= grp && cfg.hideGrp)
                                 lines.push(`  — group_id ${myGrp} >= req ${grp}: твоя группа подходит`);
+                            if (p.reply !== false && cfg.hideCantPart)
+                                lines.push(`  — permissions.reply=${p.reply ?? '—'}: нет КД`);
                             if (c === null && cfg.hideCantPart)
                                 lines.push('  — contest поля отсутствуют → НельзяУчаств. недоступно');
                             if (c && c.permissions?.can_participate !== false && cfg.hideCantPart)
@@ -1119,7 +1176,8 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
         updateBadge();
         run();
         startObserver();
-        setTimeout(checkUpdate, 3000); // проверяем обновления через 3с
+        autoFetchUserInfo();            // авто-определяем group_id если не установлен
+        setTimeout(checkUpdate, 3000);  // проверяем обновления через 3с
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
