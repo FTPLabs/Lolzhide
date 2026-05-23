@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.0
+// @version      12.1
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -29,7 +29,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.0';
+    const VERSION       = '12.1';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -88,7 +88,6 @@
 
     function log(...args) {
         if (cfg.verbose) console.log('[LolzFilter]', ...args);
-        else console.info('[LolzFilter]', ...args);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -168,6 +167,13 @@
         });
     }
 
+    function _enqueueFront(fn) {
+        return new Promise((resolve, reject) => {
+            _q.unshift({ fn, resolve, reject });
+            if (!_qBusy) _drain();
+        });
+    }
+
     function _drain() {
         if (!_q.length) { _qBusy = false; return; }
         _qBusy = true;
@@ -234,7 +240,7 @@
                         const delay = RETRY_BASE_MS * Math.pow(2, attempt);
                         log(`${r.status} сервер, retry #${attempt + 1} через ${delay}мс`);
                         setTimeout(() => {
-                            enqueue(() => _rawGet(path, attempt + 1))
+                            _enqueueFront(() => _rawGet(path, attempt + 1))
                                 .then(resolve)
                                 .catch(reject);
                         }, delay);
@@ -381,13 +387,9 @@
         const byKey = document.querySelector(`[data-content-key="thread-${id}"]`);
         if (byKey) return byKey;
 
-        // 4. Относительный URL: href="threads/NNNN/" (XenForo 1 без ведущего слэша)
-        const relLink = _findLinkAndGetRow(`a[href*="threads/${id}"]`);
-        if (relLink) return relLink;
-
-        // 5. Абсолютный URL: href="/threads/NNNN/"
-        const absLink = _findLinkAndGetRow(`a[href*="/threads/${id}"]`);
-        if (absLink) return absLink;
+        // 4. URL (относительный href="threads/NNNN/" или абсолютный href="/threads/NNNN/")
+        const linkRow = _findLinkAndGetRow(`a[href*="threads/${id}"]`);
+        if (linkRow) return linkRow;
 
         return null;
     }
@@ -443,10 +445,12 @@
     // ═══════════════════════════════════════════════════════════════
 
     const _hiddenRows = new Set();
+    let _applying = false;
 
     function applyFilter(map) {
         resetStats();
         stats.apiTotal = map.size;
+        _applying = true;
 
         // Восстанавливаем ранее скрытые строки
         for (const row of _hiddenRows) {
@@ -483,6 +487,7 @@
 
         log(`Итог: API=${stats.apiTotal} DOM=${stats.matched} скрыто=${stats.hidden}`, stats.byReason);
         updateBadge();
+        _applying = false;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -749,6 +754,7 @@
             hidePartic:   cfg.hidePartic,
             hideFinished: cfg.hideFinished,
             hideCantPart: cfg.hideCantPart,
+            hideKw:       cfg.hideKw,
             peekMode:     cfg.peekMode,
             verbose:      cfg.verbose,
         };
@@ -1142,6 +1148,7 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
             document.querySelector('.discussionListItems, .structItemContainer, .p-body-main, #content')
             ?? document.body;
         _obs = new MutationObserver(() => {
+            if (_applying) return;
             clearTimeout(_dbt);
             _dbt = setTimeout(run, 400);
         });
