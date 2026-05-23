@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.6
+// @version      12.7
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -25,16 +25,15 @@
     // ═══════════════════════════════════════════════════════════════
 
     const API           = 'https://prod-api.lolz.live';
-    const CACHE_TTL     = 2 * 60 * 1000;   // 2 минуты
+    const CACHE_TTL     = 30 * 1000;        // 30 секунд — свежие данные для быстрого обновления
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.6';
+    const VERSION       = '12.7';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
     const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/FTPLabs/Lolzhide/main/lolz-filter.user.js';
-    const SCRIPT_INSTALL_URL = 'https://raw.githubusercontent.com/FTPLabs/Lolzhide/main/lolz-filter.user.js';
 
     let _latestVersion = null;
 
@@ -91,7 +90,7 @@
     function showUpdateBadge() {
         const el = document.getElementById('lolzfp-badge');
         if (!el) return;
-        el.innerHTML = `🆕 Новая версия <b>${_latestVersion}</b>! <a href="${SCRIPT_INSTALL_URL}" target="_blank" style="color:#7eb8f7;text-decoration:underline;">Обновить</a>`;
+        el.innerHTML = `🆕 Новая версия <b>${_latestVersion}</b>! <a href="${SCRIPT_RAW_URL}" target="_blank" style="color:#7eb8f7;text-decoration:underline;">Обновить</a>`;
         el.style.color = '#7eb8f7';
     }
 
@@ -339,7 +338,7 @@
             return hit;
         }
 
-        const qs = `?forum_id=${fid}&page=${page}&limit=${THREADS_PER_PAGE}&fields_include=*`;
+        const qs = `?forum_id=${fid}&page=${page}&limit=${THREADS_PER_PAGE}&fields_include=*&fields_exclude=first_post,last_post`;
         log(`API запрос: /threads${qs}`);
 
         const data = await apiGet('/threads' + qs);
@@ -949,16 +948,25 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
             const tok = modal.querySelector('#lolz-tok').value.trim();
             const frs = modal.querySelector('#lolz-forums').value.trim();
             const kw  = modal.querySelector('#lolz-kw').value.trim();
+            const tokChanged = !!tok;
             if (tok) {
                 cfg.apiKey = tok;
                 gmSet('apiKey', tok);
                 _tokenInvalid = false;
+                cfg.userGrpId = 0; // сбрасываем group_id чтобы перезапросить для нового токена
+                gmSet('userGrpId', 0);
+                cfg.userName = '';
+                gmSet('userName', '');
             }
             if (frs) gmSet('forums', frs);
             saveCfg('hideKw', kw);
             clearCache(currentForumId());
             st('Сохранено!', '#8bc34a');
-            setTimeout(() => { modal.remove(); run(); }, 500);
+            setTimeout(() => {
+                modal.remove();
+                if (tokChanged) autoFetchUserInfo(); // авто-определяем группу для нового токена
+                run();
+            }, 500);
         });
 
         modal.querySelector('#lolz-check').addEventListener('click', () => {
@@ -1181,12 +1189,24 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
             // /threads/{id} возвращает ВСЕ поля (включая thread_post_delay)
             // это решает проблему когда list-endpoint не отдаёт это поле
             const missing = domIds.filter(id => !combined.has(id));
-            for (const id of missing.slice(0, 60)) {
+            for (const id of missing.slice(0, 100)) {
                 if (runId !== _runId) return;
+                // Сначала проверяем кэш индивидуального треда
+                const cachedSingle = getCached(fid, `single_${id}`);
+                if (cachedSingle && cachedSingle.has(id)) {
+                    combined.set(id, cachedSingle.get(id));
+                    continue;
+                }
                 try {
                     const data = await apiGet('/threads/' + id);
                     const t = data.thread ?? data;
-                    if (t && t.thread_id) combined.set(String(t.thread_id), t);
+                    if (t && t.thread_id) {
+                        const tid = String(t.thread_id);
+                        combined.set(tid, t);
+                        // Кэшируем индивидуальный тред чтобы не запрашивать повторно
+                        const singleMap = new Map([[tid, t]]);
+                        setCached(fid, `single_${tid}`, singleMap);
+                    }
                 } catch {}
             }
 
@@ -1223,7 +1243,7 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
         _obs = new MutationObserver(() => {
             if (_applying) return;
             clearTimeout(_dbt);
-            _dbt = setTimeout(run, 400);
+            _dbt = setTimeout(run, 80);
         });
         _obs.observe(target, { childList: true, subtree: true });
     }
@@ -1250,10 +1270,10 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
         autoFetchUserInfo();            // авто-определяем group_id если не установлен
         setTimeout(checkUpdate, 3000);  // проверяем обновления через 3с
 
-        // Авторефреш: каждые 10 сек перечитываем страницу и скрываем новые треды
+        // Авторефреш: каждые 2.5 сек перечитываем страницу и скрываем новые треды
         setInterval(() => {
             if (!_applying && document.visibilityState !== 'hidden') run();
-        }, 10_000);
+        }, 2500);
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
