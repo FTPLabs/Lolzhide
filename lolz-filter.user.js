@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      13.1
+// @version      13.2
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -32,7 +32,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '13.1';
+    const VERSION       = '13.2';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -487,66 +487,92 @@
         catch {}
     }
 
-    // URL темы из DOM (для GM_xmlhttpRequest нужен абсолютный URL)
+    // URL темы из DOM.
+    // ВАЖНО: используем a.href (DOM-свойство), а НЕ getAttribute().
+    // a.href уже содержит абсолютный URL с учётом тега <base> на странице.
+    // getAttribute() возвращает относительный "threads/title.12345/" и
+    // new URL(rel, location.href) даёт неверный путь /forums/NNNN/threads/...
     function _getThreadUrl(threadId) {
         const row = findRow(String(threadId));
         if (!row) return null;
         const a = row.querySelector(
-            'h3 a, h4 a, .title a, .discussionListItem--title a, ' +
+            'h3 a[href*="thread"], h4 a[href*="thread"], ' +
+            '.title a[href*="thread"], .discussionListItem--title a, ' +
             '.structItem-title a, a.listBlock-topic, a[href*="threads/"]'
         );
         if (!a) return null;
-        try { return new URL(a.getAttribute('href') || '', location.href).href; } catch { return null; }
+        // a.href — полный абсолютный URL (браузер резолвит через <base>)
+        return a.href || null;
     }
+
+    // Дедупликация: не фетчить тему, если уже идёт запрос для неё
+    const _pageCheckInProgress = new Set();
 
     // Запускает фоновую проверку страниц тем на наличие КД.
     // НЕ блокирует run() — вызывается без await.
-    // Обновляет combined и перерисовывает фильтр по мере готовности результатов.
-    function startPageChecks(domIds, combined, runId) {
+    //
+    // Ключевые исправления v13.2:
+    // • Использует _lastMap (не combined) — всегда актуальный Map даже после новых run()
+    // • Убран runId-чек в finally — он ломался при polling 2.5с (runId устаревал быстрее
+    //   чем завершались HTTP-запросы, поэтому applyFilter никогда не вызывался)
+    // • _pageCheckInProgress — не запускать дублирующий фетч для той же темы
+    function startPageChecks(domIds) {
         if (!cfg.hideCantPart) return;
 
-        // 1. Мгновенно применяем кэшированные результаты
+        // 1. Мгновенно применяем кэшированные результаты к текущему _lastMap
         let cacheApplied = false;
         for (const id of domIds) {
             const c = _getPageCache(id);
-            if (c !== null && c.delay > 0) {
-                const t = combined.get(id);
+            if (c !== null && c.delay > 0 && _lastMap?.has(id)) {
+                const t = _lastMap.get(id);
                 if (t && !t._pageDelay) {
-                    combined.set(id, { ...t, _pageDelay: c.delay });
+                    _lastMap.set(id, { ...t, _pageDelay: c.delay });
                     cacheApplied = true;
                 }
             }
         }
-        if (cacheApplied && runId === _runId) applyFilter(combined);
+        if (cacheApplied && _lastMap) applyFilter(_lastMap);
 
-        // 2. Фетчим страницы у которых нет кэша
-        const toFetch = domIds.filter(id => _getPageCache(id) === null);
+        // 2. Фетчим страницы без кэша (и не фетчащиеся прямо сейчас)
+        const toFetch = domIds.filter(
+            id => _getPageCache(id) === null && !_pageCheckInProgress.has(id)
+        );
         if (toFetch.length === 0) return;
 
-        log(`pageCheck: ${toFetch.length} тем без кэша, запускаем фоновую проверку…`);
+        log(`pageCheck: ${toFetch.length} тем без кэша, запускаем проверку…`);
 
-        const REAPPLY_EVERY = 5;    // перерисовывать каждые N результатов
+        const REAPPLY_EVERY = 5;
         let done = 0;
+        const total = toFetch.length;
 
         for (const id of toFetch) {
+            _pageCheckInProgress.add(id);
+
             const url = _getThreadUrl(id);
-            if (!url) { _setPageCache(id, 0); done++; continue; }
+            if (!url) {
+                _setPageCache(id, 0);
+                _pageCheckInProgress.delete(id);
+                done++;
+                continue;
+            }
 
             _fetchPageHtml(url)
                 .then(html => {
                     const delay = _parsePageDelay(html);
                     _setPageCache(id, delay);
-                    if (delay > 0) {
-                        const t = combined.get(id);
-                        if (t) combined.set(id, { ...t, _pageDelay: delay });
+                    // Обновляем _lastMap (текущий актуальный Map, не старый combined)
+                    if (delay > 0 && _lastMap?.has(id)) {
+                        const t = _lastMap.get(id);
+                        if (t) _lastMap.set(id, { ...t, _pageDelay: delay });
                     }
                 })
                 .catch(e => { log(`pageCheck ${id}: ${e.message}`); _setPageCache(id, 0); })
                 .finally(() => {
+                    _pageCheckInProgress.delete(id);
                     done++;
-                    const isLast = done === toFetch.length;
-                    if ((done % REAPPLY_EVERY === 0 || isLast) && runId === _runId) {
-                        applyFilter(combined);
+                    // Перерисовываем без runId-чека — _lastMap всегда актуален
+                    if ((done % REAPPLY_EVERY === 0 || done === total) && _lastMap) {
+                        applyFilter(_lastMap);
                     }
                 });
         }
@@ -1459,9 +1485,8 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
             applyFilter(combined);
 
             // ── Шаг 4: фоновая проверка страниц тем на КД ────────────────
-            // Не await — запускается параллельно, перерисовывает фильтр по мере готовности.
-            // Кэш 5 мин: повторные запуски в течение 5 мин используют кэш без HTTP-запросов.
-            startPageChecks(domIds, combined, runId);
+            // Не await — обновляет _lastMap по мере готовности, кэш 5 мин.
+            startPageChecks(domIds);
 
         } catch (e) {
             log('run() ошибка:', e.message);
