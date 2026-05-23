@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.5
+// @version      12.6
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -25,11 +25,11 @@
     // ═══════════════════════════════════════════════════════════════
 
     const API           = 'https://prod-api.lolz.live';
-    const CACHE_TTL     = 5 * 60 * 1000;   // 5 минут
+    const CACHE_TTL     = 2 * 60 * 1000;   // 2 минуты
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.5';
+    const VERSION       = '12.6';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -440,6 +440,31 @@
         try { a = document.querySelector(sel); } catch { return null; }
         if (!a) return null;
         return a.closest('.discussionListItem, .structItem--thread, .structItem, li, article') ?? null;
+    }
+
+
+    // Собираем все thread_id видимые в DOM (для infinite-scroll)
+    function getAllDomThreadIds() {
+        const ids = new Set();
+        document.querySelectorAll('[id^="thread-"]').forEach(el => {
+            const m = el.id.match(/^thread-(\d+)$/);
+            if (m) ids.add(m[1]);
+        });
+        document.querySelectorAll('[data-thread-id]').forEach(el => {
+            if (el.dataset.threadId) ids.add(String(el.dataset.threadId));
+        });
+        document.querySelectorAll('[data-content-key^="thread-"]').forEach(el => {
+            const m = el.dataset.contentKey?.match(/thread-(\d+)/);
+            if (m) ids.add(m[1]);
+        });
+        // Fallback: ссылки вида /threads/NNNN/
+        document.querySelectorAll('a[href*="threads/"]').forEach(a => {
+            const href = a.getAttribute('href') || '';
+            let m = href.match(/threads\/[^/]*\.(\d+)/);
+            if (!m) m = href.match(/threads\/(\d+)/);
+            if (m) ids.add(m[1]);
+        });
+        return [...ids];
     }
 
     function getThreadIdFromRow(row) {
@@ -1123,26 +1148,57 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
     // ═══════════════════════════════════════════════════════════════
 
     let _runId = 0;
+    // Типичное кол-во тредов на странице форума lolz.live
+    const FORUM_PAGE_SIZE = 50;
 
     async function run() {
         if (!isActiveSection()) return;
         if (!cfg.apiKey) { updateBadge(); return; }
         if (_tokenInvalid) { updateBadge(); return; }
 
-        const runId = ++_runId;
-        const fid   = currentForumId();
-        const pg    = currentPage();
+        const runId   = ++_runId;
+        const fid     = currentForumId();
+        const startPg = currentPage();
 
         setBadgeLoading();
 
         try {
-            const map = await loadPage(fid, pg);
-            if (runId !== _runId) return; // устаревший вызов
-            _lastMap = map;
-            applyFilter(map);
+            const combined = new Map();
+
+            // ── Шаг 1: загружаем страницы API под все DOM-треды ──────────
+            // Считаем сколько страниц форума загружено в DOM (infinite scroll)
+            const domIds = getAllDomThreadIds();
+            const pagesInDom = Math.max(1, Math.ceil(domIds.length / FORUM_PAGE_SIZE));
+
+            for (let p = startPg; p < startPg + pagesInDom; p++) {
+                const pageMap = await loadPage(fid, p);
+                if (runId !== _runId) return;
+                for (const [k, v] of pageMap) combined.set(k, v);
+                if (pageMap.size === 0) break;
+            }
+
+            // ── Шаг 2: добираем треды которых нет в API-ответе ───────────
+            // /threads/{id} возвращает ВСЕ поля (включая thread_post_delay)
+            // это решает проблему когда list-endpoint не отдаёт это поле
+            const missing = domIds.filter(id => !combined.has(id));
+            for (const id of missing.slice(0, 60)) {
+                if (runId !== _runId) return;
+                try {
+                    const data = await apiGet('/threads/' + id);
+                    const t = data.thread ?? data;
+                    if (t && t.thread_id) combined.set(String(t.thread_id), t);
+                } catch {}
+            }
+
+            if (runId !== _runId) return;
+
+            // ── Шаг 3: применяем фильтр ──────────────────────────────────
+            _lastMap = combined;
+            applyFilter(combined);
+
         } catch (e) {
             if (runId !== _runId) return;
-            console.error('[LolzFilter]', e.message);
+            log('run() ошибка:', e.message);
             const badge = document.getElementById('lolzfp-badge');
             if (badge) {
                 badge.classList.remove('lolzfp-loading');
@@ -1178,12 +1234,26 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
 
     function init() {
         if (!isActiveSection()) return;
+
+        // Сбрасываем кэш при смене версии (гарантируем свежие поля API)
+        const _cv = GM_getValue('lolzfp_cache_ver', '');
+        if (_cv !== VERSION) {
+            clearCache(null);
+            GM_setValue('lolzfp_cache_ver', VERSION);
+            log('Кэш очищен: версия изменилась на', VERSION);
+        }
+
         injectPanel();
         updateBadge();
         run();
         startObserver();
         autoFetchUserInfo();            // авто-определяем group_id если не установлен
         setTimeout(checkUpdate, 3000);  // проверяем обновления через 3с
+
+        // Авторефреш: каждые 10 сек перечитываем страницу и скрываем новые треды
+        setInterval(() => {
+            if (!_applying && document.visibilityState !== 'hidden') run();
+        }, 10_000);
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
