@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.3
+// @version      12.3.1
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -29,7 +29,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.3';
+    const VERSION       = '12.3.1';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -1058,9 +1058,8 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                             '─── Решение фильтров ───',
                             fmtVerdict('👥 Группа',
                                 cfg.hideGrp,
-                                grp > 0 && (myGrp === 0 || myGrp < grp),
+                                grp > 0 && (myGrp > 0 && myGrp < grp),
                                 `group: req=${grp}${grpName} my=${myGrp}`),
-                            c
                             fmtVerdict('⛔ КД',
                                 cfg.hideCantPart,
                                 p.reply === false,
