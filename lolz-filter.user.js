@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.1
+// @version      12.2
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -29,10 +29,38 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.1';
+    const VERSION       = '12.2';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
+    const SCRIPT_RAW_URL = 'https://raw.githubusercontent.com/FTPLabs/Lolzhide/main/lolz-filter.user.js';
+    const SCRIPT_INSTALL_URL = 'https://raw.githubusercontent.com/FTPLabs/Lolzhide/main/lolz-filter.user.js';
+
+    let _latestVersion = null;
+
+    function checkUpdate() {
+        GM_xmlhttpRequest({
+            method:  'GET',
+            url:     SCRIPT_RAW_URL + '?_=' + Date.now(),
+            timeout: 8000,
+            onload(r) {
+                if (r.status !== 200) return;
+                const m = r.responseText.match(/\/\/ @version\s+([\d.]+)/);
+                if (!m) return;
+                _latestVersion = m[1];
+                if (_latestVersion !== VERSION) showUpdateBadge();
+            },
+            onerror() {},
+            ontimeout() {},
+        });
+    }
+
+    function showUpdateBadge() {
+        const el = document.getElementById('lolzfp-badge');
+        if (!el) return;
+        el.innerHTML = `🆕 Новая версия <b>${_latestVersion}</b>! <a href="${SCRIPT_INSTALL_URL}" target="_blank" style="color:#7eb8f7;text-decoration:underline;">Обновить</a>`;
+        el.style.color = '#7eb8f7';
+    }
 
     // ── GM-ключи: новые (lolzfp_*) + старые (lolz_*) для обратной совместимости ──
     const K = {
@@ -40,11 +68,7 @@
         userGrpId:    ['lolzfp_user_group_id',   'lolz_user_group_id'],
         userName:     ['lolzfp_username'],
         forums:       ['lolzfp_forums',           'lolz_forums'],
-        hideCantPost: ['lolzfp_hide_cantpost',    'lolz_hide_cantpost'],
-        hideClosed:   ['lolzfp_hide_closed'],
         hideGrp:      ['lolzfp_hide_grp',         'lolz_hide_grp'],
-        hidePartic:   ['lolzfp_hide_partic',      'lolz_hide_partic'],
-        hideFinished: ['lolzfp_hide_finished'],
         hideCantPart: ['lolzfp_hide_cantpart'],
         hideKw:       ['lolzfp_hide_kw'],
         peekMode:     ['lolzfp_peek'],
@@ -70,11 +94,7 @@
         apiKey:       gmGet('apiKey',       ''),
         userGrpId:    gmGet('userGrpId',    0),
         userName:     gmGet('userName',     ''),
-        hideCantPost: gmGet('hideCantPost', true),
-        hideClosed:   gmGet('hideClosed',   false),
         hideGrp:      gmGet('hideGrp',      false),
-        hidePartic:   gmGet('hidePartic',   false),
-        hideFinished: gmGet('hideFinished', false),
         hideCantPart: gmGet('hideCantPart', false),
         hideKw:       gmGet('hideKw',       ''),
         peekMode:     gmGet('peekMode',     false),
@@ -315,22 +335,7 @@
     function shouldHide(t) {
         if (!t) return { hide: false, reason: null };
 
-        const closed = t.thread_is_closed === true;
-
-        // 1. Нет права ответить.
-        //    permissions.reply = false → нельзя написать ответ (КД, лимит постов, закрыта, ограничение группы).
-        //    permissions.post  = false → нельзя создавать темы; дополнительная страховка.
-        //    Проверяем оба: reply является точным флагом "написать в треде".
-        const canReply = t.permissions?.reply;
-        const canPost  = t.permissions?.post;
-        if (cfg.hideCantPost && (canReply === false || (canReply === undefined && canPost === false)))
-            return { hide: true, reason: 'cantPost' };
-
-        // 1b. Явно закрыта — вне зависимости от permissions
-        if (cfg.hideClosed && closed)
-            return { hide: true, reason: 'closed' };
-
-        // 2. Ограничение по группе
+        // 1. Ограничение по группе
         if (cfg.hideGrp) {
             const req = t.thread_reply_group_id ?? 0;
             if (req > 0) {
@@ -339,19 +344,11 @@
             }
         }
 
-        // 3. Уже участвовал [unverified field]
-        if (cfg.hidePartic && t.contest?.already_participate === true)
-            return { hide: true, reason: 'participated' };
-
-        // 4. Раздача завершена [unverified field]
-        if (cfg.hideFinished && (t.contest?.is_finished ?? 0) > 0)
-            return { hide: true, reason: 'finished' };
-
-        // 5. Нельзя участвовать [unverified field]
+        // 2. Нельзя участвовать [unverified field]
         if (cfg.hideCantPart && t.contest?.permissions?.can_participate === false)
             return { hide: true, reason: 'cantParticipate' };
 
-        // 6. Ключевые слова в названии (КД, кулдаун и т.д.)
+        // 3. Ключевые слова в названии
         if (cfg.hideKw) {
             const title = (t.thread_title ?? '').toLowerCase();
             const kws = cfg.hideKw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -565,11 +562,7 @@
         const flush = () => { clearCache(currentForumId()); run(); };
 
         panel.append(
-            mkToggle('🚫 Нет ответа',    cfg.hideCantPost, v => { saveCfg('hideCantPost', v); flush(); }),
-            mkToggle('🔒 Закрыта',        cfg.hideClosed,   v => { saveCfg('hideClosed',   v); flush(); }),
             mkToggle('👥 Группа',         cfg.hideGrp,      v => { saveCfg('hideGrp',      v); flush(); }),
-            mkToggle('✅ Участвовал',     cfg.hidePartic,   v => { saveCfg('hidePartic',   v); flush(); }),
-            mkToggle('🏁 Завершена',      cfg.hideFinished, v => { saveCfg('hideFinished', v); flush(); }),
             mkToggle('⛔ Нельзя участв.', cfg.hideCantPart, v => { saveCfg('hideCantPart', v); flush(); }),
         );
 
@@ -634,11 +627,7 @@
         }
 
         const parts = [];
-        if (stats.byReason.cantPost)        parts.push(`нет отв:${stats.byReason.cantPost}`);
-        if (stats.byReason.closed)          parts.push(`закрыта:${stats.byReason.closed}`);
         if (stats.byReason.group)           parts.push(`группа:${stats.byReason.group}`);
-        if (stats.byReason.participated)    parts.push(`участв:${stats.byReason.participated}`);
-        if (stats.byReason.finished)        parts.push(`завершена:${stats.byReason.finished}`);
         if (stats.byReason.cantParticipate) parts.push(`нельзя:${stats.byReason.cantParticipate}`);
         if (stats.byReason.keyword)         parts.push(`слово:${stats.byReason.keyword}`);
 
@@ -748,11 +737,7 @@
         const data = {
             _v: VERSION,
             forums:       gmGet('forums', '') || DEFAULT_FORUMS.join(','),
-            hideCantPost: cfg.hideCantPost,
-            hideClosed:   cfg.hideClosed,
             hideGrp:      cfg.hideGrp,
-            hidePartic:   cfg.hidePartic,
-            hideFinished: cfg.hideFinished,
             hideCantPart: cfg.hideCantPart,
             hideKw:       cfg.hideKw,
             peekMode:     cfg.peekMode,
@@ -764,7 +749,7 @@
     function importSettings(jsonStr) {
         let data;
         try { data = JSON.parse(jsonStr); } catch { return '❌ Неверный JSON'; }
-        const keys = ['forums','hideCantPost','hideClosed','hideGrp','hidePartic','hideFinished','hideCantPart','hideKw','peekMode','verbose'];
+        const keys = ['forums','hideGrp','hideCantPart','hideKw','peekMode','verbose'];
         for (const k of keys) {
             if (k in data) {
                 if (k === 'forums') gmSet('forums', String(data[k]));
@@ -831,12 +816,8 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
 
 <div class="lm-info">
   <b style="color:#bbb;">Что скрывает каждый фильтр:</b><br>
-  🚫 <b>Нет ответа</b> — <code>permissions.reply = false</code> или <code>permissions.post = false</code> (КД, лимит постов, закрыта, ограничение группы)<br>
-  🔒 <b>Закрыта</b> — <code>thread_is_closed = true</code> (все закрытые, даже если ты можешь писать)<br>
   👥 <b>Группа</b> — <code>thread_reply_group_id &gt; 0</code> и твоя группа ниже требуемой<br>
   &nbsp;&nbsp;&nbsp;&nbsp;21=Local · 22=Resident · 23=Expert · 60=Guru · 351=AI<br>
-  ✅ <b>Участвовал</b> — <code>contest.already_participate = true</code> <small style="color:#555;">[unverified]</small><br>
-  🏁 <b>Завершена</b> — <code>contest.is_finished &gt; 0</code> <small style="color:#555;">[unverified]</small><br>
   ⛔ <b>Нельзя участв.</b> — <code>contest.permissions.can_participate = false</code> <small style="color:#555;">[unverified]</small><br>
   🔤 <b>Ключевые слова</b> — название содержит одно из слов (регистр игнорируется)
 </div>
@@ -1017,40 +998,20 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                         const fmtVerdict = (label, active, willHide, reason) =>
                             `  ${active ? '🔵' : '⚪'} ${label}: ${active ? (willHide ? `▶ СКРЫТЬ (${reason})` : 'нет совпадения') : 'фильтр выкл.'}`;
 
-                        const closed = t.thread_is_closed === true;
                         const myGrp  = Number(cfg.userGrpId) || 0;
 
                         const lines = [
                             `[${tid}] "${(t.thread_title ?? '').slice(0, 60)}"`,
-                            `thread_is_closed        = ${t.thread_is_closed}`,
                             `thread_reply_group_id   = ${grp}${grpName}`,
-                            `permissions.post        = ${p.post}`,
-                            `permissions.reply       = ${p.reply ?? '—'}`,
                             '',
                             `contest присутствует    = ${c !== null}`,
-                            c ? `contest.already_participate  = ${c.already_participate}` : '',
-                            c ? `contest.is_finished          = ${c.is_finished}`         : '',
                             c ? `contest.can_participate      = ${c.permissions?.can_participate}` : '',
                             '',
                             '─── Решение фильтров ───',
-                            fmtVerdict('🚫 Нет ответа',
-                                cfg.hideCantPost,
-                                p.reply === false || (p.reply === undefined && p.post === false),
-                                `cantPost  [reply=${p.reply ?? '—'} post=${p.post ?? '—'}]`),
-                            fmtVerdict('🔒 Закрыта',
-                                cfg.hideClosed,
-                                closed,
-                                'closed'),
                             fmtVerdict('👥 Группа',
                                 cfg.hideGrp,
                                 grp > 0 && (myGrp === 0 || myGrp < grp),
                                 `group: req=${grp}${grpName} my=${myGrp}`),
-                            c
-                                ? fmtVerdict('✅ Участвовал',     cfg.hidePartic,   c.already_participate === true,       'participated')
-                                : '  ⚪ Участвовал: contest нет в треде',
-                            c
-                                ? fmtVerdict('🏁 Завершена',      cfg.hideFinished, (c.is_finished ?? 0) > 0,             'finished')
-                                : '  ⚪ Завершена: contest нет в треде',
                             c
                                 ? fmtVerdict('⛔ Нельзя участв.', cfg.hideCantPart, c.permissions?.can_participate === false, 'cantParticipate')
                                 : '  ⚪ Нельзя участв.: contest нет в треде',
@@ -1063,19 +1024,12 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                         if (!hide) {
                             lines.push('');
                             lines.push('💡 Почему видим:');
-                            const cantPostByApi = p.reply === false || (p.reply === undefined && p.post === false);
-                            if (!cantPostByApi)
-                                lines.push(`  — permissions.reply=${p.reply ?? '—'} permissions.post=${p.post ?? '—'}: API считает что ты можешь ответить`);
-                            if (cantPostByApi && !cfg.hideCantPost)
-                                lines.push('  — reply/post=false, но фильтр «Нет ответа» выключен');
-                            if (!cantPostByApi && p.reply === undefined && p.post === true)
-                                lines.push('  ⚠ permissions.reply отсутствует в ответе — API может не возвращать КД через этот флаг');
-                            if (closed && !cfg.hideClosed)
-                                lines.push('  — тема закрыта, но фильтр «Закрыта» выключен');
-                            if (c === null)
-                                lines.push('  — contest поля отсутствуют → Участвовал/Завершена/НельзяУчаств. недоступны');
-                            if (c && c.already_participate === false && cfg.hidePartic)
-                                lines.push('  — contest.already_participate=false: ты ещё не участвовал');
+                            if (grp > 0 && myGrp >= grp && cfg.hideGrp)
+                                lines.push(`  — group_id ${myGrp} >= req ${grp}: твоя группа подходит`);
+                            if (c === null && cfg.hideCantPart)
+                                lines.push('  — contest поля отсутствуют → НельзяУчаств. недоступно');
+                            if (c && c.permissions?.can_participate !== false && cfg.hideCantPart)
+                                lines.push(`  — contest.can_participate = ${c.permissions?.can_participate ?? '—'}: участие доступно`);
                         }
 
                         res.style.color = hide ? '#f0a84b' : '#8bc34a';
@@ -1165,6 +1119,7 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
         updateBadge();
         run();
         startObserver();
+        setTimeout(checkUpdate, 3000); // проверяем обновления через 3с
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
