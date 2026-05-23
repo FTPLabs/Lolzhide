@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lolz — Фильтр раздач
 // @namespace    https://lolz.live/
-// @version      12.7
+// @version      12.8
 // @description  Фильтр тем lolz.live на основе официального API. Поддержка XenForo 1 (id="thread-NNNN") и XenForo 2.
 // @author       FTPDev (lolz.live/ftpdev)
 // @homepageURL  https://github.com/FTPLabs/Lolzhide
@@ -29,7 +29,7 @@
     const REQ_DELAY     = 220;              // мс между запросами (API: 300 req/min → ≥200 мс)
     const MAX_RETRY     = 3;
     const RETRY_BASE_MS = 1000;
-    const VERSION       = '12.7';
+    const VERSION       = '12.8';
 
     // Читаемые названия групп (lolz.live)
     const GROUP_NAMES = { 21: 'Local', 22: 'Resident', 23: 'Expert', 60: 'Guru', 351: 'AI' };
@@ -319,14 +319,107 @@
     function apiGet(path) { return enqueue(() => _rawGet(path)); }
 
     // ═══════════════════════════════════════════════════════════════
+    //  BATCH API — POST /batch (до 10 запросов за один вызов)
+    //
+    //  Тело: [{id: "t123", uri: "/threads/123"}, ...]
+    //  Ответ: {"t123": {thread: {...}}, "t456": {thread: {...}}}
+    //  Даёт ускорение ~10× для загрузки missing-тредов.
+    // ═══════════════════════════════════════════════════════════════
+
+    const BATCH_SIZE = 10;
+
+    function _rawPost(path, body, attempt = 0) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method:  'POST',
+                url:     API + path,
+                headers: {
+                    'Authorization': `Bearer ${cfg.apiKey}`,
+                    'Accept':        'application/json',
+                    'Content-Type':  'application/json',
+                },
+                data:    JSON.stringify(body),
+                timeout: 20000,
+                onload(r) {
+                    if (r.status === 401 || r.status === 403) {
+                        _tokenInvalid = true;
+                        reject(new Error(r.status === 401 ? '401: токен недействителен' : '403: нет доступа'));
+                        return;
+                    }
+                    if (r.status === 429) {
+                        if (attempt < MAX_RETRY) {
+                            const delay = RETRY_BASE_MS * Math.pow(2, attempt);
+                            log(`429 batch, retry #${attempt + 1} через ${delay}мс`);
+                            setTimeout(() => {
+                                enqueue(() => _rawPost(path, body, attempt + 1))
+                                    .then(resolve).catch(reject);
+                            }, delay);
+                        } else {
+                            reject(new Error('429: превышен лимит запросов'));
+                        }
+                        return;
+                    }
+                    if (r.status >= 500 && attempt < MAX_RETRY) {
+                        const delay = RETRY_BASE_MS * Math.pow(2, attempt);
+                        setTimeout(() => {
+                            _enqueueFront(() => _rawPost(path, body, attempt + 1))
+                                .then(resolve).catch(reject);
+                        }, delay);
+                        return;
+                    }
+                    let d;
+                    try { d = JSON.parse(r.responseText); }
+                    catch { reject(new Error(`JSON parse error (HTTP ${r.status})`)); return; }
+                    if (d.errors) {
+                        reject(new Error(_formatApiErrors(d.errors)));
+                    } else {
+                        resolve(d);
+                    }
+                },
+                onerror()   { reject(new Error('Ошибка сети'));    },
+                ontimeout() { reject(new Error('Таймаут запроса')); },
+            });
+        });
+    }
+
+    function apiPost(path, body) { return enqueue(() => _rawPost(path, body)); }
+
+    // Загружает массив thread_id через Batch API — 10 тредов за 1 HTTP-запрос
+    async function batchLoadThreads(fid, ids) {
+        const result = new Map();
+        for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+            const chunk = ids.slice(i, i + BATCH_SIZE);
+            const jobs  = chunk.map(id => ({ id: `t${id}`, uri: `/threads/${id}` }));
+            try {
+                const data = await apiPost('/batch', jobs);
+                for (const id of chunk) {
+                    const res = data[`t${id}`];
+                    if (!res) continue;
+                    if (res.errors) { log(`batch thread ${id} ошибка:`, _formatApiErrors(res.errors)); continue; }
+                    const t = res.thread ?? res;
+                    if (t && t.thread_id) {
+                        const tid = String(t.thread_id);
+                        result.set(tid, t);
+                        setCached(fid, `single_${tid}`, new Map([[tid, t]]));
+                    }
+                }
+                log(`batch: загружено ${result.size} тредов (chunk ${Math.floor(i/BATCH_SIZE)+1}/${Math.ceil(ids.length/BATCH_SIZE)})`);
+            } catch (e) {
+                log('batch ошибка:', e.message);
+            }
+        }
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     //  ЗАГРУЗКА ТРЕДОВ
     //
     //  GET /threads?forum_id=X&page=Y&limit=L&fields_include=*
     //              &fields_exclude=first_post,last_post
     //
-    //  Поле fields_include для /threads поддерживает только "*" или "latest_posts".
-    //  fields_exclude убирает тяжёлые поля first_post и last_post.
-    //  limit=50 — запрашиваем 50 тредов за раз (форум показывает до 50 на странице).
+    //  fields_exclude задокументирован в "Common Parameters" API docs.
+    //  Убирает тяжёлые объекты first_post/last_post из каждого треда.
+    //  limit=250 — максимум за страницу API.
     // ═══════════════════════════════════════════════════════════════
 
     const THREADS_PER_PAGE = 250;
@@ -1185,29 +1278,25 @@ ${_tokenInvalid ? `<div style="margin-bottom:10px;padding:6px 10px;background:#2
                 if (pageMap.size === 0) break;
             }
 
-            // ── Шаг 2: добираем треды которых нет в API-ответе ───────────
-            // /threads/{id} возвращает ВСЕ поля (включая thread_post_delay)
-            // это решает проблему когда list-endpoint не отдаёт это поле
-            const missing = domIds.filter(id => !combined.has(id));
-            for (const id of missing.slice(0, 100)) {
-                if (runId !== _runId) return;
-                // Сначала проверяем кэш индивидуального треда
-                const cachedSingle = getCached(fid, `single_${id}`);
-                if (cachedSingle && cachedSingle.has(id)) {
-                    combined.set(id, cachedSingle.get(id));
-                    continue;
+            // ── Шаг 2: добираем треды которых нет в API-ответе (через Batch) ──
+            // /threads/{id} возвращает ВСЕ поля (включая thread_post_delay).
+            // Используем POST /batch — 10 тредов за 1 запрос вместо 10 отдельных.
+            const allMissing = domIds.filter(id => !combined.has(id)).slice(0, 100);
+            const toFetch = [];
+
+            for (const id of allMissing) {
+                const cached = getCached(fid, `single_${id}`);
+                if (cached && cached.has(id)) {
+                    combined.set(id, cached.get(id));
+                } else {
+                    toFetch.push(id);
                 }
-                try {
-                    const data = await apiGet('/threads/' + id);
-                    const t = data.thread ?? data;
-                    if (t && t.thread_id) {
-                        const tid = String(t.thread_id);
-                        combined.set(tid, t);
-                        // Кэшируем индивидуальный тред чтобы не запрашивать повторно
-                        const singleMap = new Map([[tid, t]]);
-                        setCached(fid, `single_${tid}`, singleMap);
-                    }
-                } catch {}
+            }
+
+            if (toFetch.length > 0) {
+                if (runId !== _runId) return;
+                const batchResult = await batchLoadThreads(fid, toFetch);
+                for (const [tid, t] of batchResult) combined.set(tid, t);
             }
 
             if (runId !== _runId) return;
